@@ -9,3 +9,4 @@ include/Secrets.h
 
 # original Arduino sketch + assets, kept locally only, not part of the PlatformIO port
 legacy/
+__pycache__/

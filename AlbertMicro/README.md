@@ -16,6 +16,7 @@ original Arduino sketch).
 - 🤸 **Trick poses** — push-ups, swing, gallop, sit, stand, lie down
 - 🕒 **Info screen** — clock (NTP), live weather icon + temperature (OpenWeatherMap), YouTube subscriber count
 - 📡 **Bluetooth LE UART** control (Nordic UART Service) + USB Serial control
+- 🎙️ **Voice control** — say "Hi ESP" + a command phrase into the onboard mic (offline, no cloud/internet needed — see [Voice control](#voice-control))
 
 ---
 
@@ -23,7 +24,7 @@ original Arduino sketch).
 
 | Part | Notes |
 |---|---|
-| **Seeed XIAO ESP32-S3** (or any ESP32-S3 with BLE + WiFi) | `env:seeed_xiao_esp32s3` in `platformio.ini` |
+| **Seeed XIAO ESP32-S3 *Sense*** | Needs the **Sense** variant specifically — its camera/mic expansion board is where the PDM microphone for [voice control](#voice-control) lives. The plain XIAO ESP32-S3 has no onboard mic. `env:seeed_xiao_esp32s3` in `platformio.ini` covers both. |
 | **4× micro servos** (e.g. SG90) | One per leg |
 | **0.96" 128×64 OLED, SSD1306 driver, I²C** | Address `0x3C` (some modules use `0x3D` — check the solder jumper on the back, usually marked `0x78`/`0x7A`, the 8-bit equivalents) |
 | Battery / 5 V supply | Servos draw current — power them separately from the ESP32 logic if you can |
@@ -50,6 +51,8 @@ board — always translate through this table:
 | `D8` | GPIO7 | free |
 | `D9` (printed "MISO") | GPIO8 | OLED SDA |
 | `D10` (printed "MOSI") | GPIO9 | OLED SCL |
+| *(no header pin — on the Sense expansion board)* | GPIO41 | Onboard PDM mic — data |
+| *(no header pin — on the Sense expansion board)* | GPIO42 | Onboard PDM mic — clock |
 
 Note the OLED is wired to `D9`/`D10` (labeled MISO/MOSI on the board), **not**
 the pins printed "SDA"/"SCL" (those are `D4`/`D5` = GPIO5/6) — the ESP32's I²C
@@ -71,6 +74,8 @@ Servo 2 (back-left)   -> D2 (GPIO3)
 Servo 3 (back-right)  -> D3 (GPIO4)
 Servo VCC -> 5V (external supply recommended)
 Servo GND -> common GND with ESP32
+
+Onboard PDM mic (Sense expansion board — no wiring needed, already connected)
 ```
 
 > The exact leg-to-servo mapping depends on how you assemble the body. If a
@@ -93,8 +98,25 @@ libraries automatically on first build:
 - Adafruit SSD1306
 - FluxGarage RoboEyes
 
-(WiFi, HTTPClient, Wire, time, and the BLE libraries ship with the
-`espressif32` Arduino framework, no extra `lib_deps` entry needed.)
+(WiFi, HTTPClient, Wire, time, BLE, `ESP_I2S` and `ESP_SR` all ship with the
+Arduino framework core itself, no extra `lib_deps` entry needed.)
+
+> ⚠️ **Platform note:** `platformio.ini` points `platform` at a pinned
+> [**pioarduino**](https://github.com/pioarduino/platform-espressif32)
+> release zip instead of the plain `espressif32` registry entry. Voice
+> control ([`ESP_SR`](#voice-control)) needs Arduino-ESP32 core 3.3.x, which
+> the official PlatformIO registry doesn't ship yet — pioarduino is a
+> community fork that tracks newer core releases, same `platform_packages`
+> API otherwise. First install downloads a full new toolchain/framework and
+> can take a few minutes.
+
+On first upload, a PlatformIO post-action ([`flash_sr_models.py`](flash_sr_models.py))
+automatically flashes the ~3.2 MB speech-recognition model file
+(`srmodels.bin`, bundled with the framework — not part of this repo) to the
+`model` partition right after the firmware. This adds maybe 10–20 seconds to
+the first `pio run -t upload`; you'll see a
+`Flashing speech-recognition model...` line in the terminal. It re-flashes
+this every upload — harmless, just a bit of extra time per upload.
 
 ### 2. Configure your secrets
 Copy the template and fill in your own values:
@@ -204,6 +226,7 @@ Scan, connect to **AlbertMini**, open the UART/terminal view, and type a command
 | `STOP`    | Stop moving (idle) |
 | `UP`      | Stand up (legs centered) |
 | `DOWN`    | Lie down |
+| `SIT`     | Sit (front legs up, rear legs down) |
 | `REST`    | Rest pose, sleepy eyes, screen off |
 | `INFO`    | Sit + show clock / weather / YouTube info screen |
 | `PUSHUPS` | Do push-ups (angry eyes) |
@@ -212,6 +235,70 @@ Scan, connect to **AlbertMini**, open the UART/terminal view, and type a command
 | `SCAN`    | Re-run the I²C bus scan (debug — see Troubleshooting) |
 
 Commands are case-insensitive. On boot the robot starts in **REST**.
+
+---
+
+## Voice control
+
+Albert also listens on the **onboard PDM microphone** (XIAO ESP32-S3 *Sense*
+only) using Espressif's offline **ESP-SR** speech recognition — no WiFi,
+no cloud, no internet needed, everything runs on-chip.
+
+**How it works:** say the wake word **"Hi ESP"**, wait for it to start
+listening (a few seconds), then say one of the command phrases below. Each
+phrase runs the exact same code path as typing the matching command over
+BLE/Serial — same eyes, same gait engine, same everything. After a command
+(or a few seconds of silence), it goes back to waiting for the wake word.
+
+> 🔒 **Why "Hi ESP" and not a custom wake word?** ESP-SR ships a whole
+> catalog of pre-trained wake words ("Alexa", "Jarvis", "Computer", …), but
+> the prebuilt model file this Arduino library bundles only includes **one**
+> of them — "Hi ESP" — to keep it a reasonable size. Picking a different one
+> (or a fully custom "Hey Albert") means building ESP-SR from source with a
+> different config, i.e. a full ESP-IDF project instead of this simple
+> Arduino sketch — out of scope here, but see the
+> [esp-sr repo](https://github.com/espressif/esp-sr) if you want to go down
+> that road later.
+
+### Voice command reference
+
+Command *phrases* are plain English text — no training needed, ESP-SR
+converts them to phonemes at boot. Feel free to edit/add phrases in the
+`sr_commands[]` table in [`src/main.cpp`](src/main.cpp) (search for
+"VOICE CONTROL"); each entry is `{command, "phrase to say"}`.
+
+"Sit down", "Lie down", "Walk" and "Dance" are the phrases from the original
+TechTalkies voice-dog project this was merged from. "Good boy" and "Stretch"
+are that project's other two phrases, repurposed to the closest matching
+moves Albert actually has (rest / stand) since Albert has no wag or stretch
+animation. Everything else is new, covering the rest of Albert's command set.
+
+| Say "Hi ESP", then... | Same as typed command | Action |
+|---|---|---|
+| "Walk"        | `WALK`    | Walk forward |
+| "Go back"     | `BACK`    | Walk backward |
+| "Turn left"   | `LEFT`    | Strafe / turn left |
+| "Turn right"  | `RIGHT`   | Strafe / turn right |
+| "Spin left"   | `SL`      | Spin left in place |
+| "Spin right"  | `SR`      | Spin right in place |
+| "Stop"        | `STOP`    | Stop moving |
+| "Stretch"     | `UP`      | Stand up |
+| "Sit down"    | `SIT`     | Sit |
+| "Lie down"    | `DOWN`    | Lie down |
+| "Good boy"    | `REST`    | Rest pose, sleepy eyes, screen off |
+| "Show info"   | `INFO`    | Sit + show clock/weather/YouTube info screen |
+| "Push ups"    | `PUSHUPS` | Do push-ups |
+| "Dance"       | `SWING`   | Swing dance |
+| "Gallop"      | `GALLOP`  | Gallop animation |
+
+### Voice troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| Nothing happens when saying "Hi ESP" | Confirm it's a **Sense** board (mic present) and check Serial Monitor for `ERROR: onboard PDM microphone init failed` at boot |
+| Wake word triggers but commands are never recognized | Speak clearly a beat after the wake word, close to the mic, in a reasonably quiet room — offline command recognition is less forgiving than cloud assistants |
+| Wrong command triggers | Try rephrasing closer to the exact phrase text in the table above, or add your own alternate phrasing for that command in `sr_commands[]` |
+| First upload is slow / seems stuck after "Flashing speech-recognition model..." | Expected — it's writing a ~3.2 MB file. Let it finish; don't unplug |
 
 ---
 
@@ -262,3 +349,10 @@ thunderstorm** (anything else falls back to a cloud).
 - Eyes animation: **FluxGarage RoboEyes** library
 - Weather data: **OpenWeatherMap**
 - Subscriber stats: **YouTube Data API v3**
+- Voice control: **Espressif ESP-SR** (WakeNet + MultiNet), via the `ESP_SR`
+  Arduino library — command-phrase idea merged in from
+  [TechTalkies' "100 Pet Dog"](https://github.com/TechTalkies/YouTube/tree/main/100%20Pet%20Dog)
+  voice-controlled robot dog project
+- Toolchain: **[pioarduino](https://github.com/pioarduino/platform-espressif32)**
+  community platform (for a newer Arduino-ESP32 core than PlatformIO's
+  official registry currently ships)
