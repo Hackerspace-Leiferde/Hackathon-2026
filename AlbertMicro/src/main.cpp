@@ -12,6 +12,8 @@
 #include <BLE2902.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <ESP_I2S.h>
+#include <ESP_SR.h>
 
 #include <FluxGarage_RoboEyes.h>
 #undef N
@@ -497,8 +499,107 @@ void handleCommand(String input) {
   else if (input == "GALLOP")   { currentMode = MODE_IDLE; syncCurrentPos(); runGallopSequence();          }
   else if (input == "UP")       { currentMode = MODE_IDLE; syncCurrentPos(); runUpSequence();               }
   else if (input == "DOWN")     { currentMode = MODE_IDLE; syncCurrentPos(); runDownSequence();             }
+  else if (input == "SIT")      { currentMode = MODE_IDLE; syncCurrentPos(); runSitSequence();               }
   else if (input == "SCAN")     { scanI2C();                                                                 }
   else { Serial.print("Unknown: "); Serial.println(input); }
+}
+
+// =====================================================
+// VOICE CONTROL (ESP_SR — onboard PDM microphone)
+// -----------------------------------------------------
+// XIAO ESP32S3 *Sense* only — the plain XIAO ESP32S3 has no onboard mic.
+// Wake word "Hi ESP" is the only one baked into the prebuilt srmodels.bin
+// that ships with this Arduino core (see README "Voice control" section
+// for why — picking a different wake word needs a from-scratch ESP-IDF
+// build, not just this Arduino sketch). Command phrases below are plain
+// English text — ESP_SR converts them to phonemes at boot, no training
+// needed, so feel free to edit/add phrases.
+//
+// Flow: say "Hi ESP" -> WakeNet fires -> switch to command listening ->
+// say one of the phrases below -> MultiNet matches it to a command_id ->
+// we look up the matching text command and feed it into handleCommand(),
+// exactly as if it had arrived over BLE/Serial. A few seconds of silence
+// after a command times out back to wake-word listening.
+// =====================================================
+#define PDM_PIN_CLK  42
+#define PDM_PIN_DATA 41
+
+#define SR_SAMPLE_RATE 16000  // ESP_SR requires 16-bit / 16kHz audio
+
+I2SClass micI2S;
+
+enum VoiceCmd {
+  VC_WALK, VC_BACK, VC_LEFT, VC_RIGHT, VC_SPIN_LEFT, VC_SPIN_RIGHT,
+  VC_STOP, VC_STAND, VC_SIT, VC_LIE_DOWN, VC_REST, VC_INFO,
+  VC_PUSHUPS, VC_DANCE, VC_GALLOP,
+  VC_COUNT
+};
+
+// command_id -> the text command handleCommand() already understands.
+// Index must match the VoiceCmd enum above.
+static const char* const voiceCmdText[VC_COUNT] = {
+  "WALK", "BACK", "LEFT", "RIGHT", "SL", "SR",
+  "STOP", "UP", "SIT", "DOWN", "REST", "INFO",
+  "PUSHUPS", "SWING", "GALLOP",
+};
+
+// Command phrases MultiNet listens for once woken up.
+// "Sit down", "Lie down", "Walk", "Dance" reuse phrases from the original
+// TechTalkies voice-dog project; "Good boy" -> REST and "Stretch" -> UP
+// (stand pose) are the closest match among Albert's own moves for the two
+// original phrases that don't have a direct equivalent here. Everything
+// else is new, covering the rest of Albert's existing command set.
+static const sr_cmd_t sr_commands[] = {
+  {VC_WALK,       "Walk"},
+  {VC_BACK,       "Go back"},
+  {VC_LEFT,       "Turn left"},
+  {VC_RIGHT,      "Turn right"},
+  {VC_SPIN_LEFT,  "Spin left"},
+  {VC_SPIN_RIGHT, "Spin right"},
+  {VC_STOP,       "Stop"},
+  {VC_STAND,      "Stretch"},
+  {VC_SIT,        "Sit down"},
+  {VC_LIE_DOWN,   "Lie down"},
+  {VC_REST,       "Good boy"},
+  {VC_INFO,       "Show info"},
+  {VC_PUSHUPS,    "Push ups"},
+  {VC_DANCE,      "Dance"},
+  {VC_GALLOP,     "Gallop"},
+};
+
+void onVoiceEvent(sr_event_t event, int command_id, int phrase_id) {
+  switch (event) {
+    case SR_EVENT_WAKEWORD:
+      Serial.println("Voice: wake word detected, listening for a command...");
+      ESP_SR.setMode(SR_MODE_COMMAND);
+      break;
+    case SR_EVENT_TIMEOUT:
+      Serial.println("Voice: timed out, back to listening for wake word");
+      ESP_SR.setMode(SR_MODE_WAKEWORD);
+      break;
+    case SR_EVENT_COMMAND:
+      if (command_id >= 0 && command_id < VC_COUNT) {
+        Serial.print("Voice command: "); Serial.println(voiceCmdText[command_id]);
+        handleCommand(String(voiceCmdText[command_id]));
+      }
+      ESP_SR.setMode(SR_MODE_COMMAND);  // stay listening for another command before timing out
+      break;
+    default: break;
+  }
+}
+
+void initVoice() {
+  micI2S.setPinsPdmRx(PDM_PIN_CLK, PDM_PIN_DATA);
+  if (!micI2S.begin(I2S_MODE_PDM_RX, SR_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO, I2S_STD_SLOT_RIGHT)) {
+    Serial.println("ERROR: onboard PDM microphone init failed — voice control disabled");
+    return;
+  }
+  ESP_SR.onEvent(onVoiceEvent);
+  if (!ESP_SR.begin(micI2S, sr_commands, VC_COUNT, SR_CHANNELS_MONO, SR_MODE_WAKEWORD, "M")) {
+    Serial.println("ERROR: ESP_SR.begin() failed — voice control disabled");
+    return;
+  }
+  Serial.println("Voice control ready — say \"Hi ESP\" to wake Albert up.");
 }
 
 // =====================================================
@@ -548,6 +649,7 @@ void setup() {
   roboEyes.setCuriosity(ON);
 
   initBLE();
+  initVoice();
 
   for (int i = 0; i < NUM_SERVOS; i++) {
     servos[i].attach(SERVO_PINS[i]);
