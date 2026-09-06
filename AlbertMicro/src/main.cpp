@@ -3,6 +3,8 @@
 #include <math.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -603,6 +605,147 @@ void initVoice() {
 }
 
 // =====================================================
+// WEB CONTROL (WiFi joystick UI)
+// -----------------------------------------------------
+// Serves a touch-friendly control page at http://<ip>/ (printed by
+// connectWiFi(), or http://albert.local/ once mDNS resolves). It's a plain
+// HTTP GET API on top of the same handleCommand() dispatcher BLE and voice
+// control already use, so every predefined command is available here too.
+// Directional buttons (walk/back/left/right/spin) send STOP automatically
+// on release so the robot doesn't keep moving after you let go.
+// =====================================================
+WebServer webServer(80);
+
+const char WEB_PAGE[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>AlbertMicro Control</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; padding: 16px; min-height: 100vh;
+    background: #14161a; color: #eee;
+    font-family: -apple-system, system-ui, sans-serif;
+    display: flex; flex-direction: column; align-items: center; gap: 20px;
+    user-select: none;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 4px 0; color: #9fd6ff; }
+  #status { font-size: 12px; color: #888; min-height: 14px; }
+  button {
+    border: none; border-radius: 14px; background: #24272e; color: #eee;
+    font-size: 15px; font-weight: 600; padding: 0;
+    touch-action: manipulation; transition: background 0.08s, transform 0.08s;
+  }
+  button:active, button.active { background: #3a7bd5; transform: scale(0.95); }
+
+  .dpad {
+    display: grid;
+    grid-template-columns: 64px 64px 64px;
+    grid-template-rows: 64px 64px 64px;
+    gap: 8px;
+  }
+  .dpad button { width: 64px; height: 64px; font-size: 22px; touch-action: none; }
+  .dpad .stop { background: #5a2020; font-size: 13px; }
+  .dpad .stop.active, .dpad .stop:active { background: #c0392b; }
+  .spin-row { display: flex; gap: 8px; }
+  .spin-row button { width: 100px; height: 44px; font-size: 14px; touch-action: none; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 88px);
+    gap: 8px;
+    max-width: 300px;
+  }
+  .grid button { height: 48px; }
+</style>
+</head>
+<body>
+  <h1>AlbertMicro</h1>
+  <div id="status">ready</div>
+
+  <div class="dpad">
+    <div></div><button id="btn-WALK" data-hold="WALK">&#9650;</button><div></div>
+    <button id="btn-LEFT" data-hold="LEFT">&#9664;</button>
+    <button id="btn-STOP" class="stop" data-tap="STOP">STOP</button>
+    <button id="btn-RIGHT" data-hold="RIGHT">&#9654;</button>
+    <div></div><button id="btn-BACK" data-hold="BACK">&#9660;</button><div></div>
+  </div>
+
+  <div class="spin-row">
+    <button id="btn-SL" data-hold="SL">&#8634; Spin L</button>
+    <button id="btn-SR" data-hold="SR">&#8635; Spin R</button>
+  </div>
+
+  <div class="grid">
+    <button data-tap="UP">Stand</button>
+    <button data-tap="SIT">Sit</button>
+    <button data-tap="DOWN">Lie down</button>
+    <button data-tap="REST">Rest</button>
+    <button data-tap="INFO">Info</button>
+    <button data-tap="SCAN">I2C Scan</button>
+    <button data-tap="PUSHUPS">Pushups</button>
+    <button data-tap="SWING">Swing</button>
+    <button data-tap="GALLOP">Gallop</button>
+  </div>
+
+<script>
+  const statusEl = document.getElementById('status');
+  let busy = false;
+
+  function sendCmd(c) {
+    statusEl.textContent = c;
+    fetch('/cmd?c=' + encodeURIComponent(c)).catch(() => {
+      statusEl.textContent = c + ' (connection error)';
+    });
+  }
+
+  // one-shot buttons: send their command on tap/click
+  document.querySelectorAll('[data-tap]').forEach(btn => {
+    btn.addEventListener('click', () => sendCmd(btn.dataset.tap));
+  });
+
+  // hold buttons: send the direction on press, STOP on release
+  document.querySelectorAll('[data-hold]').forEach(btn => {
+    const cmd = btn.dataset.hold;
+    const start = e => { e.preventDefault(); btn.classList.add('active'); sendCmd(cmd); };
+    const stop  = e => {
+      if (!btn.classList.contains('active')) return;
+      e.preventDefault(); btn.classList.remove('active'); sendCmd('STOP');
+    };
+    btn.addEventListener('pointerdown', start);
+    btn.addEventListener('pointerup', stop);
+    btn.addEventListener('pointerleave', stop);
+    btn.addEventListener('pointercancel', stop);
+  });
+</script>
+</body>
+</html>
+)HTMLPAGE";
+
+void handleWebRoot() {
+  webServer.send_P(200, "text/html", WEB_PAGE);
+}
+
+void handleWebCmd() {
+  if (!webServer.hasArg("c")) { webServer.send(400, "text/plain", "missing arg: c"); return; }
+  handleCommand(webServer.arg("c"));
+  webServer.send(200, "text/plain", "OK");
+}
+
+void initWebServer() {
+  webServer.on("/", HTTP_GET, handleWebRoot);
+  webServer.on("/cmd", HTTP_GET, handleWebCmd);
+  webServer.begin();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Web control ready: http://" + WiFi.localIP().toString() + "/");
+    if (MDNS.begin("albert")) Serial.println("Web control also at: http://albert.local/");
+  }
+}
+
+// =====================================================
 // I2C DIAGNOSTICS
 // Runs at boot, and on demand via the "SCAN" serial/BLE command —
 // so you don't have to race the Serial Monitor to catch boot output.
@@ -661,6 +804,7 @@ void setup() {
   enterRest();
 
   connectWiFi();
+  initWebServer();
   updateWeather();
   updateTime();
   updateYouTube();
@@ -674,6 +818,8 @@ void setup() {
 // LOOP
 // =====================================================
 void loop() {
+  webServer.handleClient();
+
   if (Serial.available() > 0) handleCommand(Serial.readStringUntil('\n'));
   if (bleBuffer.length() > 0) { handleCommand(bleBuffer); bleBuffer = ""; }
 
